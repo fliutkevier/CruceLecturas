@@ -1,0 +1,4 @@
+# Ruta de la configuracion compartida de CruceLecturas.
+# La app lee de aca los verificadores y los errores conocidos.
+# Dejar este archivo junto a CruceLecturas.exe.
+\\192.168.10.4\s\Gas Natural Lectura 2019-2020\CruceLecturas_verificadores\config.json
