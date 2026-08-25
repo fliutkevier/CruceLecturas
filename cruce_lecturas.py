@@ -24,9 +24,10 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-VERSION = "2.3"
+VERSION = "2.7"
 
-URL_EXPORT = "https://psm.emaservicios.com.ar/visualizador/export"
+# Visualizador NUEVO (gasnor-lecturas). Si cambia, se edita aca.
+URL_EXPORT = "https://psm.emaservicios.com.ar/api/gasnor/exportar_lecturas"
 
 # --------------------------------------------------------------------------
 # Configuración
@@ -93,6 +94,7 @@ ORDEN_SALIDA = [
     ("AÑO",                      "AÑO DE FAC",            "ANIO"),
     ("RUTA",                     "RUTA",                  None),
     ("POLIZA",                   "POLIZA",                "POLIZA"),
+    ("N° DE MEDIDOR",            "@MEDIDOR",              "NRO-MEDIDOR"),
     ("CLIENTE",                  "CLIENTE",               None),
     ("EMPRESA",                  None,                    "EMPRESA"),
     ("NOMBREFOTO",               None,                    "NOMBREFOTO"),
@@ -111,7 +113,7 @@ ORDEN_SALIDA = [
     ("ENTRE CALLES",             "ENTRE CALLES",          None),
     ("ACCESO PM",                "ACCESO PM",             None),
     ("DATOS DOMICILIO",          "DATOS_DOM_SERVICIO",    "@DOMICILIO_NAT"),
-    ("N° DE MEDIDOR",            "@MEDIDOR",              "NRO-MEDIDOR"),
+    ("INFO DE LECTURISTA",       "AVISO_LECTURISTA",      None),
     ("AVISO-LECTOR",             "ORDENATIVO",            "AVISO-LECTOR"),
     ("COMENTARIO LECTOR",        "COMENTARIO LECTURISTA", None),
     ("LINK DE FOTO",             "FOTO 1",                None),
@@ -136,6 +138,30 @@ ORDEN_SALIDA = [
 COLS_NUMERICAS = {"TURNO", "BIMESTRE", "AÑO", "POLIZA", "USUARIO", "LEGAJO",
                   "N° DE MEDIDOR", "LECTURA ANTERIOR", "LECTURA ACTUAL", "CONSUMO"}
 
+# El visualizador nuevo (gasnor-lecturas) renombro 4 columnas. Se aceptan las
+# dos escrituras para que sigan andando las bajadas viejas.
+ALIAS_COLUMNAS = {
+    COL_OBS:              ["OBSERVACION DE AUDITORÍA", "OBSERVACION DE AUDITORIA"],
+    COL_CATEGORIA:        ["CATEGORIA_ERROR", "CATEGORIA DE ERROR"],
+    "AVISO_LECTURISTA":   ["AVISO_LECTURISTA", "AVISO LECTURISTA"],
+    "DATOS_DOM_SERVICIO": ["DATOS_DOM_SERVICIO", "DATOS DOM. SERVICIO",
+                           "DATOS DOM SERVICIO"],
+}
+
+
+def resolver_indices(headers):
+    """Mapa nombre_canonico -> posicion, resolviendo los alias del visualizador."""
+    idx = {h: i for i, h in enumerate(headers)}
+    for canonico, variantes in ALIAS_COLUMNAS.items():
+        if canonico in idx:
+            continue
+        for v in variantes:
+            if v in idx:
+                idx[canonico] = idx[v]
+                break
+    return idx
+
+
 COLS_REQUERIDAS_VIS = [COL_POLIZA, COL_TURNO, COL_OBS, COL_AUDITOR]
 COLS_REQUERIDAS_NAT = ["POLIZA", "TURNO", "ANIO", "BIMESTRE", "CORRECTO"]
 
@@ -149,7 +175,8 @@ VERIFICADORES_POR_DEFECTO = [
     {"nombre": "Federico weber", "iniciales": "FW"},
 ]
 
-URL_EXPORT = "https://psm.emaservicios.com.ar/visualizador/export"
+# Visualizador NUEVO (gasnor-lecturas). Si cambia, se edita aca.
+URL_EXPORT = "https://psm.emaservicios.com.ar/api/gasnor/exportar_lecturas"
 
 
 def recurso(nombre):
@@ -175,8 +202,22 @@ def abrir_archivo(ruta):
         return False
 
 
-def descargar_turno(turno, periodo, anio, carpeta=None, timeout=180):
-    """Descarga el export del visualizador. Devuelve la ruta del archivo."""
+def cargar_token():
+    """Token de la API del visualizador. Es personal: va en la config LOCAL."""
+    return _leer_json(ruta_config_local()).get("token_visualizador") or ""
+
+
+def guardar_token(token):
+    return _escribir_json(ruta_config_local(),
+                          {"token_visualizador": (token or "").strip()})
+
+
+def descargar_turno(turno, periodo, anio, carpeta=None, timeout=180, token=None):
+    """Descarga el export del visualizador. Devuelve la ruta del archivo.
+
+    El visualizador nuevo (gasnor-lecturas) exige un token JWT en la cabecera
+    Authorization. Sin token, el servidor responde 401.
+    """
     try:
         import requests
     except ImportError:
@@ -184,13 +225,28 @@ def descargar_turno(turno, periodo, anio, carpeta=None, timeout=180):
             "Falta la librería 'requests'.\nInstalala con: pip install requests")
 
     params = {
+        "page": 1, "order_by": "turno", "order_dir": "asc",
         "turno": turno, "periodo": periodo, "anio": anio,
-        "fecha_desde": "", "fecha_hasta": "",
-        "filtro_nro_medidor": "", "filtro_poliza": "",
-        "origen": "lecturas",
     }
+    token = (token if token is not None else cargar_token()).strip()
+    cabeceras = {}
+    if token:
+        if not token.lower().startswith("bearer "):
+            token = "Bearer " + token
+        cabeceras["Authorization"] = token
+
     try:
-        r = requests.get(URL_EXPORT, params=params, timeout=timeout)
+        r = requests.get(URL_EXPORT, params=params, headers=cabeceras, timeout=timeout)
+    except Exception as exc:
+        raise RuntimeError(f"No se pudo conectar con el visualizador.\n\n{exc}")
+
+    if r.status_code in (401, 403):
+        raise RuntimeError(
+            "El visualizador rechazó la credencial (error "
+            f"{r.status_code}).\n\n"
+            "El token vence cada cierto tiempo. Cargá uno nuevo con el botón "
+            "'Token...' o bajá el archivo a mano y usá 'Seleccionar archivo'.")
+    try:
         r.raise_for_status()
     except Exception as exc:
         raise RuntimeError(f"No se pudo descargar el turno.\n\n{exc}")
@@ -717,11 +773,11 @@ def procesar_cruce(ruta_bajada, texto_polizas, verificadores=None, hoy=None,
         errores, con_codigo = cargar_errores()
 
     wb, it, headers = _abrir(ruta_bajada)
-    faltantes = [c for c in COLS_REQUERIDAS_VIS if c not in headers]
+    idx = resolver_indices(headers)
+    faltantes = [c for c in COLS_REQUERIDAS_VIS if c not in idx]
     if faltantes:
         wb.close()
         raise ValueError("La bajada no tiene las columnas esperadas: " + ", ".join(faltantes))
-    idx = {h: i for i, h in enumerate(headers)}
 
     seleccion = {v.strip().lower() for v in (verificadores or []) if v and v.strip()}
     excluidas = parsear_polizas_pegadas(texto_polizas)
@@ -733,7 +789,7 @@ def procesar_cruce(ruta_bajada, texto_polizas, verificadores=None, hoy=None,
         """Guarda la fila cruda (sin transformar) para no perder nada."""
         apartadas.append([motivo] + [c.value for c in fila])
     total_filas = total_con_obs = ya_cargados = duplicados = 0
-    filtrados = limpiadas = multi_autor = sin_fecha = sin_categoria = 0
+    filtrados = limpiadas = multi_autor = sin_fecha = sin_categoria = solo_categoria = 0
     turno = ""
 
     for fila in it:
@@ -743,9 +799,14 @@ def procesar_cruce(ruta_bajada, texto_polizas, verificadores=None, hoy=None,
         if not turno:
             turno = normalizar_poliza(fila[idx[COL_TURNO]].value) or ""
 
-        if not _texto(fila[idx[COL_OBS]].value):
+        # Entra si tiene observacion O categoria: no se pierde nada cargado.
+        tiene_obs = bool(_texto(fila[idx[COL_OBS]].value))
+        tiene_cat = bool(_texto(fila[idx[COL_CATEGORIA]].value)) if COL_CATEGORIA in idx else False
+        if not (tiene_obs or tiene_cat):
             continue
         total_con_obs += 1
+        if tiene_cat and not tiene_obs:
+            solo_categoria += 1
 
         poliza = normalizar_poliza(fila[idx[COL_POLIZA]].value)
         if poliza in excluidas:
@@ -777,19 +838,19 @@ def procesar_cruce(ruta_bajada, texto_polizas, verificadores=None, hoy=None,
             fecha_obs = hoy
             sin_fecha += 1
 
-        # CATEGORIA: la del visualizador si viene; si no, se deduce del texto.
         # CATEGORIA: sale del desplegable del visualizador, no del texto.
         cat = normalizar_categoria(
             fila[idx[COL_CATEGORIA]].value if COL_CATEGORIA in idx else None)
         if not cat:
             sin_categoria += 1
-            sin_reconocer.append(obs_limpia)   # queda con CATEGORIA vacia, no se aparta
+            if obs_limpia:
+                sin_reconocer.append(obs_limpia)  # queda con CATEGORIA vacia, no se aparta
 
         # DETALLE: la observacion limpia. Si arranca repitiendo una categoria
         # (dato viejo, antes de que existiera el desplegable), se le quita para
         # no duplicar el mismo texto en dos columnas. "FALTA AVISO ..." NO se
         # toca: es un detalle, no una categoria.
-        detalle = obs_limpia
+        detalle = obs_limpia or ""     # puede venir solo la categoria, sin texto
         if cat and detalle.upper().startswith(cat.upper()):
             # Solo se quita si REPITE la categoria ya guardada. Si el texto dice
             # otra cosa que el desplegable, se conserva: esa discrepancia es
@@ -819,7 +880,7 @@ def procesar_cruce(ruta_bajada, texto_polizas, verificadores=None, hoy=None,
         "excluidas_pegadas": len(excluidas), "ya_cargados": ya_cargados,
         "filtrados": filtrados, "duplicados": duplicados, "limpiadas": limpiadas,
         "multi_autor": multi_autor, "sin_fecha": sin_fecha,
-        "sin_categoria": sin_categoria,
+        "sin_categoria": sin_categoria, "solo_categoria": solo_categoria,
         "desconocidos": sorted(desconocidos),
         "sin_reconocer": sorted(set(sin_reconocer)),
         "columnas_ausentes": [],
@@ -1045,6 +1106,29 @@ def lanzar_ui():
     e_anio.pack(side="left", padx=(4, 10))
     btn_imp = ttk.Button(imp, text="Importar turno"); btn_imp.pack(side="left")
 
+    def editar_token():
+        actual = cargar_token()
+        t = simpledialog.askstring(
+            "Token del visualizador",
+            "Pegá el token de la API (Authorization).\n"
+            "Se guarda solo en esta PC y vence cada cierto tiempo.\n\n"
+            "Se obtiene en el visualizador: F12 → Red → una petición a /api/gasnor/ →\n"
+            "cabecera 'Authorization' (sin el 'Bearer ').",
+            initialvalue=actual, parent=root)
+        if t is None:
+            return
+        if not guardar_token(t):
+            messagebox.showwarning("Sin permisos", "No se pudo guardar el token.")
+        refrescar_token()
+
+    def refrescar_token():
+        hay = bool(cargar_token())
+        btn_tok.config(text="Token ✓" if hay else "Token...")
+
+    btn_tok = ttk.Button(imp, text="Token...", command=editar_token, width=10)
+    btn_tok.pack(side="left", padx=(6, 0))
+    refrescar_token()
+
     fc = ttk.Frame(tab_vis); fc.pack(fill="x", pady=(2, 2))
     ttk.Label(fc, text="Guardar bajadas en:", foreground="#555").pack(side="left")
     lbl_carpeta = ttk.Label(fc, foreground="#333"); lbl_carpeta.pack(side="left", padx=(6, 6))
@@ -1104,7 +1188,7 @@ def lanzar_ui():
 
         def trabajo():
             try:
-                ruta = descargar_turno(turno, per, anio, destino)
+                ruta = descargar_turno(turno, per, anio, destino)  # usa el token guardado
             except Exception as exc:
                 # Se captura por valor: Python borra `exc` al salir del except,
                 # y el lambda corre despues (fallaria con NameError).
@@ -1242,6 +1326,8 @@ def lanzar_ui():
         if st["duplicados"]:
             det.append(f"Duplicados colapsados: {st['duplicados']}")
         det.append(f"Observaciones limpiadas: {st['limpiadas']}")
+        if st["solo_categoria"]:
+            det.append(f"Con categoría pero sin observación: {st['solo_categoria']}")
         if st["sin_categoria"]:
             det.append(f"Sin categoría reconocida: {st['sin_categoria']}")
         if st["multi_autor"]:
