@@ -11,20 +11,20 @@ Solo se modifican: VERIFICADO (pasa a contener el auditor), la observación
 (se le quitan fecha e iniciales) y se agrega una columna de fecha.
 """
 
+import csv
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
-import threading
 from datetime import date, datetime, time
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-VERSION = "2.7"
+VERSION = "3.1"
 
 # Visualizador NUEVO (gasnor-lecturas). Si cambia, se edita aca.
 URL_EXPORT = "https://psm.emaservicios.com.ar/api/gasnor/exportar_lecturas"
@@ -70,6 +70,13 @@ CATEGORIAS = [
 ALIAS_CATEGORIA = {"ERROR DE ANOMALIA": "ANOMALIA INCORRECTA"}
 
 ESTADO_INICIAL = "EN TRATAMIENTO"
+
+ORIGEN_VIS = "INTERNO"
+ORIGEN_NAT = "CLIENTE"
+ORIGEN_ZYD = "AUDITORIA"
+
+# Valores que las planillas de origen usan como "vacio" (errores de formula).
+VACIOS = {"#N/D", "#N/A", "#VALOR!", "#REF!", "#¡REF!", "NULL", ""}
 RE_CODIGO = re.compile(r"[A-Z0-9]{1,3}$")
 
 # <fecha> seguida de 2-3 iniciales en mayuscula, en cualquier parte del texto.
@@ -85,52 +92,52 @@ HOJA_DESCONOCIDOS = "DESCONOCIDOS"
 COL_MOTIVO = "MOTIVO"
 
 # --- Formato unificado de salida (41 columnas) -----------------------------
-# (columna final, campo del VISUALIZADOR, campo de la MUESTRA)
+# (columna final, campo del VISUALIZADOR, campo de la MUESTRA, campo de Z y D)
 # Los tokens que empiezan con "@" los calcula la app.
 ORDEN_SALIDA = [
-    ("ORIGEN",                   "@ORIGEN",               "@ORIGEN"),
-    ("TURNO",                    "TURNO",                 "TURNO"),
-    ("BIMESTRE",                 "PERIODO",               "BIMESTRE"),
-    ("AÑO",                      "AÑO DE FAC",            "ANIO"),
-    ("RUTA",                     "RUTA",                  None),
-    ("POLIZA",                   "POLIZA",                "POLIZA"),
-    ("N° DE MEDIDOR",            "@MEDIDOR",              "NRO-MEDIDOR"),
-    ("CLIENTE",                  "CLIENTE",               None),
-    ("EMPRESA",                  None,                    "EMPRESA"),
-    ("NOMBREFOTO",               None,                    "NOMBREFOTO"),
-    ("AVISO",                    None,                    "AVISO"),
-    ("SUBAVISOS",                None,                    "SUBAVISOS"),
-    ("%AUDITORIA",               None,                    "%AUDITORIA"),
-    ("IND-RECLAMO",              None,                    "IND-RECLAMO"),
-    ("LECTURA CORREGIDA",        None,                    "LECTURA CORREGIDA"),
-    ("FECHA LECTURA",            "@FECHA_VIS",            "@FECHA_NAT"),
-    ("HORA LECTURA",             "@HORA_VIS",             "@HORA_NAT"),
-    ("USUARIO",                  "@USUARIO",              "LECTURISTA"),
-    ("LEGAJO",                   "@LEGAJO",               None),
-    ("NOMBRE Y APELLIDO",        "@NOMBRE",               None),
-    ("LOCALIDAD",                "LOCALIDAD",             "LOCALIDAD"),
-    ("CALLE",                    "CALLE",                 "@CALLE_NAT"),
-    ("ENTRE CALLES",             "ENTRE CALLES",          None),
-    ("ACCESO PM",                "ACCESO PM",             None),
-    ("DATOS DOMICILIO",          "DATOS_DOM_SERVICIO",    "@DOMICILIO_NAT"),
-    ("INFO DE LECTURISTA",       "AVISO_LECTURISTA",      None),
-    ("AVISO-LECTOR",             "ORDENATIVO",            "AVISO-LECTOR"),
-    ("COMENTARIO LECTOR",        "COMENTARIO LECTURISTA", None),
-    ("LINK DE FOTO",             "FOTO 1",                None),
-    ("LECTURA ANTERIOR",         "LEC ANTERIOR",          None),
-    ("LECTURA ACTUAL",           "LEC ACTUAL",            "LECTURA-ACTUAL"),
-    ("CONSUMO",                  "CONSUMO",               None),
-    ("VERIFICADOR DE INICIO",    "USUARIO AUDITOR",       None),
-    ("FECHA VERIFICADO",         "@FECHA_VERIF",          None),
-    ("DETALLE DE ERROR",         "@DETALLE",              None),
-    ("CATEGORIA",                "@CATEGORIA",            "@CATEGORIA_NAT"),
-    ("AUDITORIA",                None,                    None),
-    ("RESOLUCION",               None,                    None),
-    ("DETALLE RESOLUCION",       None,                    None),
-    ("FECHA DE AVISO AL LECTOR", None,                    None),
-    ("VERIFICADOR DE CIERRE",    None,                    None),
-    ("OBSERVACIONES",            None,                    None),
-    ("ESTADO",                   "@ESTADO",               None),
+    ("ORIGEN",                   "@ORIGEN",               "@ORIGEN", "@ORIGEN"),
+    ("TURNO",                    "TURNO",                 "TURNO", "TURNO"),
+    ("BIMESTRE",                 "PERIODO",               "BIMESTRE", "BIMESTRE"),
+    ("AÑO",                      "AÑO DE FAC",            "ANIO", "ANIO"),
+    ("RUTA",                     "RUTA",                  None, "NRO-RUTA"),
+    ("POLIZA",                   "POLIZA",                "POLIZA", "POLIZA"),
+    ("N° DE MEDIDOR",            "@MEDIDOR",              "NRO-MEDIDOR", "NRO-MEDIDOR"),
+    ("CLIENTE",                  "CLIENTE",               None, None),
+    ("EMPRESA",                  None,                    "EMPRESA", None),
+    ("NOMBREFOTO",               None,                    "NOMBREFOTO", None),
+    ("AVISO",                    None,                    "AVISO", None),
+    ("SUBAVISOS",                None,                    "SUBAVISOS", "SUBAVISOS"),
+    ("%AUDITORIA",               None,                    "%AUDITORIA", None),
+    ("IND-RECLAMO",              None,                    "IND-RECLAMO", None),
+    ("LECTURA CORREGIDA",        None,                    "LECTURA CORREGIDA", None),
+    ("FECHA LECTURA",            "@FECHA_VIS",            "@FECHA_NAT", "@FECHA_NAT"),
+    ("HORA LECTURA",             "@HORA_VIS",             "@HORA_NAT", "@HORA_NAT"),
+    ("USUARIO",                  "@USUARIO",              "LECTURISTA", "LECTURISTA"),
+    ("LEGAJO",                   "@LEGAJO",               None, None),
+    ("NOMBRE Y APELLIDO",        "@NOMBRE",               None, None),
+    ("LOCALIDAD",                "LOCALIDAD",             "LOCALIDAD", "LOCALIDAD"),
+    ("CALLE",                    "CALLE",                 "@CALLE_NAT", "@CALLE_NAT"),
+    ("ENTRE CALLES",             "ENTRE CALLES",          None, None),
+    ("ACCESO PM",                "ACCESO PM",             None, None),
+    ("DATOS DOMICILIO",          "DATOS_DOM_SERVICIO",    "@DOMICILIO_NAT", "@DOMICILIO_NAT"),
+    ("INFO DE LECTURISTA",       "AVISO_LECTURISTA",      None, None),
+    ("AVISO-LECTOR",             "ORDENATIVO",            "AVISO-LECTOR", "AVISO-LECTOR"),
+    ("COMENTARIO LECTOR",        "COMENTARIO LECTURISTA", None, None),
+    ("LINK DE FOTO",             "FOTO 1",                None, None),
+    ("LECTURA ANTERIOR",         "LEC ANTERIOR",          None, None),
+    ("LECTURA ACTUAL",           "LEC ACTUAL",            "LECTURA-ACTUAL", None),
+    ("CONSUMO",                  "CONSUMO",               None, None),
+    ("VERIFICADOR DE INICIO",    "@VERIFICADOR",          None, None),
+    ("FECHA VERIFICADO",         "@FECHA_VERIF",          None, None),
+    ("DETALLE DE ERROR",         "@DETALLE",              None, "SUBAVISOS"),
+    ("CATEGORIA",                "@CATEGORIA",            "@CATEGORIA_NAT", None),
+    ("AUDITORIA",                None,                    None, None),
+    ("RESOLUCION",               None,                    None, None),
+    ("DETALLE RESOLUCION",       None,                    None, "AVISO"),
+    ("FECHA DE AVISO AL LECTOR", None,                    None, None),
+    ("VERIFICADOR DE CIERRE",    None,                    None, None),
+    ("OBSERVACIONES",            None,                    None, "OBSERVACIONES"),
+    ("ESTADO",                   "@ESTADO",               None, None),
 ]
 
 # Se guardan como numero para que las dos fuentes convivan: la muestra manda
@@ -166,13 +173,15 @@ COLS_REQUERIDAS_VIS = [COL_POLIZA, COL_TURNO, COL_OBS, COL_AUDITOR]
 COLS_REQUERIDAS_NAT = ["POLIZA", "TURNO", "ANIO", "BIMESTRE", "CORRECTO"]
 
 
+# El cotejo contra el visualizador NO distingue mayusculas, asi que alcanza con
+# escribirlos una vez de forma prolija.
 VERIFICADORES_POR_DEFECTO = [
-    {"nombre": "Tomas barragan", "iniciales": "TB"},
+    {"nombre": "Tomas Barragan", "iniciales": "TB"},
     {"nombre": "Juan Piccioli", "iniciales": "JP"},
     {"nombre": "Lucas Rodriguez", "iniciales": "LR"},
     {"nombre": "Candela Bolzan", "iniciales": "CB"},
-    {"nombre": "Franco fliutkevier", "iniciales": "FL"},
-    {"nombre": "Federico weber", "iniciales": "FW"},
+    {"nombre": "Franco Fliutkevier", "iniciales": "FL"},
+    {"nombre": "Federico Weber", "iniciales": "FW"},
 ]
 
 # Visualizador NUEVO (gasnor-lecturas). Si cambia, se edita aca.
@@ -202,6 +211,12 @@ def abrir_archivo(ruta):
         return False
 
 
+# ---------------------------------------------------------------------------
+# DESCARGA REMOTA — DESACTIVADA
+# El visualizador nuevo exige un token JWT que vence. Hasta que haya un token
+# de servicio, el archivo se carga a mano. Todo esto queda listo para
+# reactivarlo: solo hay que volver a poner los controles en la pestaña.
+# ---------------------------------------------------------------------------
 def cargar_token():
     """Token de la API del visualizador. Es personal: va en la config LOCAL."""
     return _leer_json(ruta_config_local()).get("token_visualizador") or ""
@@ -582,7 +597,12 @@ def separar_error_detalle(texto, errores=None, con_codigo=None):
 
 
 def _texto(valor):
-    return "" if valor is None else str(valor).strip()
+    """Texto limpio. Los errores de formula (#N/D) y el espacio duro cuentan
+    como vacio: vienen asi desde las planillas de origen."""
+    if valor is None:
+        return ""
+    t = str(valor).replace("\xa0", " ").strip()
+    return "" if t.upper() in VACIOS else t
 
 
 def _num(valor):
@@ -691,6 +711,20 @@ def calle_naturgy(calle, finca):
     return " ".join(p for p in (_texto(calle), _texto(finca)) if p) or None
 
 
+def normalizar_nombre(valor):
+    """Unifica la escritura de un nombre propio.
+
+    El visualizador devuelve el mismo auditor de varias formas ('TOMAS BARRAGAN',
+    'tomas barragan', 'Tomas barragan'). Se guarda siempre con la inicial de cada
+    palabra en mayuscula: 'Tomas Barragan'. Sin esto, PowerBI los cuenta como
+    personas distintas.
+    """
+    t = _texto(valor)
+    if not t:
+        return None
+    return " ".join(p.capitalize() for p in t.split())
+
+
 def normalizar_categoria(valor):
     """Pasa a mayusculas y aplica los alias (ERROR DE ANOMALIA -> ANOMALIA INCORRECTA)."""
     t = _texto(valor).upper()
@@ -779,7 +813,10 @@ def procesar_cruce(ruta_bajada, texto_polizas, verificadores=None, hoy=None,
         wb.close()
         raise ValueError("La bajada no tiene las columnas esperadas: " + ", ".join(faltantes))
 
-    seleccion = {v.strip().lower() for v in (verificadores or []) if v and v.strip()}
+    # Se compara sobre el nombre normalizado: asi no importan ni las mayusculas
+    # ni los espacios de mas ('  juan   PICCIOLI  ' == 'Juan Piccioli').
+    seleccion = {(normalizar_nombre(v) or "").lower()
+                 for v in (verificadores or []) if v and v.strip()}
     excluidas = parsear_polizas_pegadas(texto_polizas)
 
     filas_salida, vistas, desconocidos, sin_reconocer = [], set(), set(), []
@@ -814,7 +851,7 @@ def procesar_cruce(ruta_bajada, texto_polizas, verificadores=None, hoy=None,
             continue
 
         auditor = fila[idx[COL_AUDITOR]].value
-        nombre = _texto(auditor)
+        nombre = normalizar_nombre(auditor) or ""
         if seleccion and nombre.lower() not in seleccion:
             if nombre:
                 desconocidos.add(nombre)
@@ -866,6 +903,7 @@ def procesar_cruce(ruta_bajada, texto_polizas, verificadores=None, hoy=None,
             "@HORA_VIS": hora_visualizador(fila[idx["HORA"]].value) if "HORA" in idx else None,
             "@USUARIO": usuario, "@LEGAJO": legajo, "@NOMBRE": nombre_ap,
             "@MEDIDOR": limpiar_medidor(fila[idx["NRO MEDIDOR"]].value) if "NRO MEDIDOR" in idx else None,
+            "@VERIFICADOR": nombre or None,
             "@FECHA_VERIF": fecha_obs,
             "@DETALLE": detalle or None,
             "@CATEGORIA": cat,
@@ -890,6 +928,125 @@ def procesar_cruce(ruta_bajada, texto_polizas, verificadores=None, hoy=None,
         "headers_origen": [COL_MOTIVO] + headers,
     }
     return headers_salida(), filas_salida, stats, apartadas
+
+
+# --------------------------------------------------------------------------
+# Lectura de CSV (los avisos Z y D llegan en ese formato)
+# --------------------------------------------------------------------------
+def _abrir_csv(ruta):
+    """Devuelve (headers, filas) de un CSV con separador y encoding autodetectados."""
+    crudo = open(ruta, "rb").read()
+    texto = None
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            texto = crudo.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if texto is None:
+        raise ValueError("No se pudo leer el archivo: codificación desconocida.")
+
+    lineas = texto.splitlines()
+    if not lineas:
+        raise ValueError("El archivo está vacío.")
+    # Separador: el mas frecuente en la primera linea.
+    sep = max((";", ",", "\t"), key=lambda s: lineas[0].count(s))
+    filas = list(csv.reader(lineas, delimiter=sep))
+    return filas[0], filas[1:]
+
+
+class _Celda:
+    """Imita la celda de openpyxl para reusar el mismo armado de filas."""
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+
+# --------------------------------------------------------------------------
+# Procesamiento: AVISOS Z Y D
+# --------------------------------------------------------------------------
+def procesar_zyd(ruta_archivo, texto_polizas=""):
+    """Convierte el archivo de avisos Z y D al formato unificado.
+
+    A diferencia del cruce, las pólizas pegadas se BUSCAN: si se pega algo,
+    solo salen esas. Vacío = salen todas.
+    """
+    if ruta_archivo.lower().endswith(".csv"):
+        headers, crudas = _abrir_csv(ruta_archivo)
+        filas_iter = ([_Celda(v) for v in f] for f in crudas)
+        wb = None
+    else:
+        wb, filas_iter, headers = _abrir(ruta_archivo)
+
+    headers = [_texto(h) for h in headers]
+    idx = {h: i for i, h in enumerate(headers)}
+    faltantes = [c for c in ("POLIZA", "TURNO", "ANIO", "BIMESTRE") if c not in idx]
+    if faltantes:
+        if wb:
+            wb.close()
+        raise ValueError("El archivo no tiene las columnas esperadas: "
+                         + ", ".join(faltantes))
+
+    buscadas = parsear_polizas_pegadas(texto_polizas)
+    encontradas = set()
+
+    def v(fila, campo):
+        pos = idx.get(campo)
+        if pos is None or pos >= len(fila):
+            return None
+        return fila[pos].value
+
+    filas_salida = []
+    total = descartadas = sin_fecha = sin_hora = 0
+    turno = ""
+
+    for fila in filas_iter:
+        if all(_texto(c.value) == "" for c in fila):
+            continue
+        total += 1
+        if not turno:
+            turno = normalizar_poliza(v(fila, "TURNO")) or ""
+
+        poliza = normalizar_poliza(v(fila, "POLIZA"))
+        if buscadas:
+            if poliza not in buscadas:
+                descartadas += 1
+                continue
+            encontradas.add(poliza)
+
+        f = fecha_naturgy(v(fila, "FECHA-LECT"))
+        h = hora_naturgy(v(fila, "HORA-LECT"))
+        if f is None:
+            sin_fecha += 1
+        if h is None:
+            sin_hora += 1
+
+        calc = {
+            "@ORIGEN": ORIGEN_ZYD,
+            "@FECHA_NAT": f, "@HORA_NAT": h,
+            "@CALLE_NAT": calle_naturgy(v(fila, "CALLE"), v(fila, "FINCA")),
+            "@DOMICILIO_NAT": domicilio_naturgy(None, None,
+                                                v(fila, "PISO"), v(fila, "PUERTA")),
+        }
+        filas_salida.append(_armar_fila(calc, fila, idx, 3))
+
+    if wb:
+        wb.close()
+
+    stats = {
+        "fuente": "zyd", "total_filas": total, "nuevos": len(filas_salida),
+        "buscadas": len(buscadas), "encontradas": len(encontradas),
+        "no_encontradas": sorted(buscadas - encontradas),
+        "descartadas": descartadas,
+        "sin_fecha": sin_fecha, "sin_hora": sin_hora, "turno": turno,
+        "columnas_ausentes": [c for c in ("NRO-MEDIDOR", "AVISO-LECTOR", "SUBAVISOS",
+                                          "CALLE", "FINCA", "PISO", "PUERTA",
+                                          "LOCALIDAD", "LECTURISTA", "FECHA-LECT",
+                                          "HORA-LECT", "NRO-RUTA", "OBSERVACIONES",
+                                          "AVISO") if c not in idx],
+    }
+    return headers_salida(), filas_salida, stats
 
 
 # --------------------------------------------------------------------------
@@ -1026,7 +1183,7 @@ def lanzar_ui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, simpledialog, ttk
 
-    estado = {"bajada": None, "muestra": None,
+    estado = {"bajada": None, "muestra": None, "zyd": None,
               "verificadores": cargar_verificadores(), "vars": {}}
 
     if sys.platform == "win32":
@@ -1039,7 +1196,7 @@ def lanzar_ui():
 
     root = tk.Tk()
     root.title(f"Cruce de Lecturas v{VERSION}")
-    root.geometry("720x880")
+    root.geometry("760x900")
     root.minsize(660, 720)
 
     for candidato in ("icono.ico", "icon.ico"):
@@ -1063,8 +1220,10 @@ def lanzar_ui():
     nb.pack(fill="both", expand=True)
     tab_vis = ttk.Frame(nb, padding=12)
     tab_nat = ttk.Frame(nb, padding=12)
+    tab_zyd = ttk.Frame(nb, padding=12)
     nb.add(tab_vis, text="  Visualizador (verificadores)  ")
     nb.add(tab_nat, text="  Muestra de Naturgy  ")
+    nb.add(tab_zyd, text="  Avisos Z y D  ")
 
     def guardar_resultado(headers, filas, turno, prefijo, detalle,
                           apartadas=None, headers_apartadas=None):
@@ -1095,66 +1254,10 @@ def lanzar_ui():
         estado["bajada"] = ruta
         lbl_archivo.config(text=os.path.basename(ruta), foreground="#000")
 
-    imp = ttk.Frame(tab_vis)
-    imp.pack(fill="x", pady=(4, 2))
-    ttk.Label(imp, text="Turno").pack(side="left")
-    e_turno = ttk.Entry(imp, width=6); e_turno.pack(side="left", padx=(4, 10))
-    ttk.Label(imp, text="Período").pack(side="left")
-    e_per = ttk.Entry(imp, width=6); e_per.pack(side="left", padx=(4, 10))
-    ttk.Label(imp, text="Año").pack(side="left")
-    e_anio = ttk.Entry(imp, width=8); e_anio.insert(0, str(date.today().year))
-    e_anio.pack(side="left", padx=(4, 10))
-    btn_imp = ttk.Button(imp, text="Importar turno"); btn_imp.pack(side="left")
-
-    def editar_token():
-        actual = cargar_token()
-        t = simpledialog.askstring(
-            "Token del visualizador",
-            "Pegá el token de la API (Authorization).\n"
-            "Se guarda solo en esta PC y vence cada cierto tiempo.\n\n"
-            "Se obtiene en el visualizador: F12 → Red → una petición a /api/gasnor/ →\n"
-            "cabecera 'Authorization' (sin el 'Bearer ').",
-            initialvalue=actual, parent=root)
-        if t is None:
-            return
-        if not guardar_token(t):
-            messagebox.showwarning("Sin permisos", "No se pudo guardar el token.")
-        refrescar_token()
-
-    def refrescar_token():
-        hay = bool(cargar_token())
-        btn_tok.config(text="Token ✓" if hay else "Token...")
-
-    btn_tok = ttk.Button(imp, text="Token...", command=editar_token, width=10)
-    btn_tok.pack(side="left", padx=(6, 0))
-    refrescar_token()
-
-    fc = ttk.Frame(tab_vis); fc.pack(fill="x", pady=(2, 2))
-    ttk.Label(fc, text="Guardar bajadas en:", foreground="#555").pack(side="left")
-    lbl_carpeta = ttk.Label(fc, foreground="#333"); lbl_carpeta.pack(side="left", padx=(6, 6))
-
-    def refrescar_carpeta():
-        ruta = carpeta_descargas()
-        existe = os.path.isdir(ruta) or ruta == carpeta_descargas_por_defecto()
-        texto = ruta if len(ruta) <= 48 else "..." + ruta[-45:]
-        if not existe:
-            texto += "   (no disponible)"
-        lbl_carpeta.config(text=texto, foreground="#333" if existe else "#B00")
-
-    def cambiar_carpeta():
-        elegida = filedialog.askdirectory(title="¿Dónde guardo las bajadas?")
-        if not elegida:
-            return
-        if not guardar_carpeta_descargas(elegida):
-            messagebox.showwarning("Sin permisos",
-                                   "Se usa ahora, pero no se pudo guardar la preferencia.")
-        refrescar_carpeta()
-
-    ttk.Button(fc, text="Cambiar...", command=cambiar_carpeta).pack(side="left")
-    refrescar_carpeta()
-
-    f1 = ttk.Frame(tab_vis); f1.pack(fill="x", pady=(2, 4))
-    ttk.Label(f1, text="Alternativa:", foreground="#888").pack(side="left", padx=(0, 6))
+    ttk.Label(tab_vis, foreground="#555", wraplength=640, justify="left",
+              text="Descargá el turno desde el visualizador y seleccioná el archivo acá.").pack(
+        anchor="w", pady=(2, 4))
+    f1 = ttk.Frame(tab_vis); f1.pack(fill="x", pady=(0, 4))
 
     def elegir():
         ruta = filedialog.askopenfilename(
@@ -1163,52 +1266,8 @@ def lanzar_ui():
         if ruta:
             fijar_bajada(ruta)
 
-    btn_elegir = ttk.Button(f1, text="Seleccionar archivo...", command=elegir)
-    btn_elegir.pack(side="left")
+    ttk.Button(f1, text="Seleccionar archivo...", command=elegir).pack(side="left")
     lbl_archivo.pack(anchor="w", pady=(0, 10))
-
-    def importar():
-        turno, per, anio = (e_turno.get().strip(), e_per.get().strip(), e_anio.get().strip())
-        if not (turno.isdigit() and per.isdigit() and anio.isdigit()):
-            messagebox.showwarning("Datos incompletos",
-                                   "Turno, período y año tienen que ser números.")
-            return
-        destino = carpeta_descargas()
-        if not os.path.isdir(destino):
-            try:
-                os.makedirs(destino, exist_ok=True)
-            except OSError:
-                if not messagebox.askyesno("Carpeta no disponible",
-                        f"No se puede acceder a:\n{destino}\n\n¿Usar la temporal?"):
-                    return
-                destino = carpeta_descargas_por_defecto()
-        btn_imp.config(state="disabled", text="Descargando...")
-        btn_elegir.config(state="disabled")
-        lbl_archivo.config(text="Descargando del visualizador...", foreground="#888")
-
-        def trabajo():
-            try:
-                ruta = descargar_turno(turno, per, anio, destino)  # usa el token guardado
-            except Exception as exc:
-                # Se captura por valor: Python borra `exc` al salir del except,
-                # y el lambda corre despues (fallaria con NameError).
-                mensaje = str(exc)
-                root.after(0, lambda m=mensaje: fin(None, m))
-            else:
-                root.after(0, lambda r=ruta: fin(r, None))
-
-        def fin(ruta, error):
-            btn_imp.config(state="normal", text="Importar turno")
-            btn_elegir.config(state="normal")
-            if error:
-                lbl_archivo.config(text="Ningún archivo seleccionado", foreground="#888")
-                messagebox.showerror("Error al importar", error)
-            else:
-                fijar_bajada(ruta); refrescar_carpeta()
-
-        threading.Thread(target=trabajo, daemon=True).start()
-
-    btn_imp.config(command=importar)
 
     ttk.Label(tab_vis, text="2 · Verificadores a incluir",
               font=("Segoe UI", 10, "bold")).pack(anchor="w")
@@ -1406,6 +1465,99 @@ def lanzar_ui():
 
     ttk.Button(tab_nat, text="Procesar muestra", command=ejecutar_nat).pack(
         fill="x", ipady=6, pady=(16, 0))
+
+    # =====================================================================
+    # PESTAÑA 3 — AVISOS Z Y D
+    # =====================================================================
+    ttk.Label(tab_zyd, text="1 · Archivo de avisos",
+              font=("Segoe UI", 10, "bold")).pack(anchor="w")
+    ttk.Label(tab_zyd, foreground="#555", wraplength=640, justify="left",
+              text="Seleccioná el archivo de avisos Z y D (.csv o .xlsx). "
+                   "Se convierte al mismo formato, con ORIGEN = "
+                   f"{ORIGEN_ZYD}.").pack(anchor="w", pady=(2, 6))
+
+    fz = ttk.Frame(tab_zyd); fz.pack(fill="x")
+    lbl_zyd = ttk.Label(fz, text="Ningún archivo seleccionado", foreground="#888")
+
+    def elegir_zyd():
+        ruta = filedialog.askopenfilename(
+            title="Seleccioná el archivo de avisos Z y D",
+            filetypes=[("Avisos", "*.csv *.xlsx *.xlsm"), ("Todos", "*.*")])
+        if ruta:
+            estado["zyd"] = ruta
+            lbl_zyd.config(text=os.path.basename(ruta), foreground="#000")
+
+    ttk.Button(fz, text="Seleccionar archivo...", command=elegir_zyd).pack(side="left")
+    lbl_zyd.pack(side="left", padx=10)
+
+    ttk.Label(tab_zyd, text="2 · Pólizas a buscar",
+              font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(14, 0))
+    ttk.Label(tab_zyd, foreground="#555", wraplength=640, justify="left",
+              text="Pegá las pólizas que querés extraer. Acá el campo funciona al "
+                   "revés que en el cruce: en vez de descartarlas, las busca.\n"
+                   "Si lo dejás vacío, salen todas las filas del archivo.").pack(
+        anchor="w", pady=(2, 4))
+
+    marco_z = ttk.Frame(tab_zyd); marco_z.pack(fill="both", expand=True)
+    scr_z = ttk.Scrollbar(marco_z); scr_z.pack(side="right", fill="y")
+    txt_z = tk.Text(marco_z, height=9, yscrollcommand=scr_z.set, font=("Consolas", 9))
+    txt_z.pack(side="left", fill="both", expand=True)
+    scr_z.config(command=txt_z.yview)
+
+    lbl_cz = ttk.Label(tab_zyd, text="0 pólizas · salen TODAS las filas",
+                       foreground="#666")
+    lbl_cz.pack(anchor="w", pady=(4, 10))
+
+    def actualizar_z(_e=None):
+        n = len(parsear_polizas_pegadas(txt_z.get("1.0", "end")))
+        lbl_cz.config(text=f"{n} pólizas · salen TODAS las filas" if n == 0
+                      else f"{n} pólizas a buscar")
+
+    txt_z.bind("<KeyRelease>", actualizar_z)
+    txt_z.bind("<<Paste>>", lambda e: root.after(50, actualizar_z))
+
+    def ejecutar_zyd():
+        if not estado.get("zyd"):
+            messagebox.showwarning("Falta el archivo",
+                                   "Seleccioná el archivo de avisos Z y D.")
+            return
+        try:
+            headers, filas, st = procesar_zyd(estado["zyd"], txt_z.get("1.0", "end"))
+        except Exception as exc:
+            messagebox.showerror("Error al procesar", str(exc))
+            return
+        if st["columnas_ausentes"]:
+            if not messagebox.askyesno("Columnas faltantes",
+                    "El archivo no trae estas columnas y saldrán vacías:\n\n"
+                    + "\n".join(st["columnas_ausentes"]) + "\n\n¿Continuar?"):
+                return
+        if st["no_encontradas"]:
+            faltan = st["no_encontradas"]
+            recorte = faltan[:15]
+            if not messagebox.askyesno("Pólizas no encontradas",
+                    f"{len(faltan)} de las {st['buscadas']} pólizas pegadas no están "
+                    "en el archivo:\n\n" + "\n".join(recorte)
+                    + ("\n..." if len(faltan) > 15 else "")
+                    + "\n\n¿Continuar igual?"):
+                return
+        if st["nuevos"] == 0:
+            messagebox.showinfo("Sin filas",
+                f"Se revisaron {st['total_filas']} filas y ninguna coincide.")
+            return
+        det = [f"Filas en el archivo: {st['total_filas']}"]
+        if st["buscadas"]:
+            det.append(f"Pólizas buscadas: {st['buscadas']}")
+            det.append(f"Encontradas: {st['encontradas']}")
+            det.append(f"Descartadas (no pedidas): {st['descartadas']}")
+        if st["sin_fecha"]:
+            det.append(f"Sin fecha reconocible: {st['sin_fecha']}")
+        if st["sin_hora"]:
+            det.append(f"Sin hora reconocible: {st['sin_hora']}")
+        det.append(f"\nFILAS EN EL ARCHIVO: {st['nuevos']}")
+        guardar_resultado(headers, filas, st["turno"], "ZyD", det)
+
+    ttk.Button(tab_zyd, text="Procesar avisos", command=ejecutar_zyd).pack(
+        fill="x", ipady=6)
 
     # =====================================================================
     # PIE

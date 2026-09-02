@@ -47,10 +47,6 @@ python -c "import openpyxl" 2>nul || (
     echo       Instalando openpyxl...
     python -m pip install --quiet openpyxl || goto :error_dep
 )
-python -c "import requests" 2>nul || (
-    echo       Instalando requests...
-    python -m pip install --quiet requests || goto :error_dep
-)
 python -c "import PyInstaller" 2>nul || (
     echo       Instalando pyinstaller...
     python -m pip install --quiet pyinstaller || goto :error_dep
